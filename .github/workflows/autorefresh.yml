@@ -1,0 +1,41 @@
+name: Build SideStore (auto-refresh restored)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - run: brew install ldid xcbeautify
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: "26.4"
+
+      - name: Check the fix is present
+        run: grep -n "setMinimumBackgroundFetchInterval" AltStore/AppDelegate.swift
+
+      - name: Build
+        run: python3 scripts/ci/workflow.py build
+
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="autorefresh-${{ github.run_number }}"
+          gh release create "$TAG" SideStore.ipa \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --draft \
+            --title "SideStore 0.7.0-alpha + auto-refresh (build ${{ github.run_number }})" \
+            --notes "0.7.0-alpha with setMinimumBackgroundFetchInterval restored."
