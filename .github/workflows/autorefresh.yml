@@ -1,6 +1,8 @@
 name: Build SideStore (auto-refresh restored)
 
 on:
+  push:
+    branches: [autorefresh]
   workflow_dispatch:
 
 permissions:
