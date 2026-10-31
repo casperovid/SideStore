@@ -378,7 +378,8 @@ extension AppDelegate
     {
         // Restored (removed upstream in bde73894): without this the fetch interval is
         // UIApplicationBackgroundFetchIntervalNever, so iOS never wakes SideStore to refresh apps.
-        UIApplication.shared.setMinimumBackgroundFetchInterval(1 * 60 * 60)
+        // At most twice a day.
+        UIApplication.shared.setMinimumBackgroundFetchInterval(12 * 60 * 60)
 
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { (success, error) in
             // no-op

@@ -351,12 +351,12 @@ public extension InstalledApp
     
     class func fetchAppsForBackgroundRefresh(in context: NSManagedObjectContext) -> [InstalledApp]
     {
-        // Date 6 hours before now.
-        let date = Date().addingTimeInterval(-1 * 6 * 60 * 60)
-        
+        // Only refresh apps that expire within 2 days from now.
+        let date = Date().addingTimeInterval(2 * 24 * 60 * 60)
+
         let predicate = NSPredicate(format: "(%K == YES) AND (%K < %@) AND (%K != %@) AND (%K == nil OR %K == NO OR %K == YES)",
                                     #keyPath(InstalledApp.isActive),
-                                    #keyPath(InstalledApp.refreshedDate), date as NSDate,
+                                    #keyPath(InstalledApp.expirationDate), date as NSDate,
                                     #keyPath(InstalledApp.bundleIdentifier), StoreApp.altstoreAppID,
                                     #keyPath(InstalledApp.storeApp),
                                     #keyPath(InstalledApp.storeApp.isPledgeRequired),
@@ -367,7 +367,7 @@ public extension InstalledApp
                                              sortedBy: [NSSortDescriptor(keyPath: \InstalledApp.expirationDate, ascending: true)],
                                              in: context)
         
-        if let altStoreApp = InstalledApp.fetchAltStore(in: context), altStoreApp.refreshedDate < date
+        if let altStoreApp = InstalledApp.fetchAltStore(in: context), altStoreApp.expirationDate < date
         {
             if let storeApp = altStoreApp.storeApp
             {
