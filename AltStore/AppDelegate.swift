@@ -13,6 +13,12 @@ import Intents
 import SideSign
 import CoreData
 import Nuke
+import BackgroundTasks
+
+private final class RefreshOperationBox: @unchecked Sendable
+{
+    var operation: BackgroundRefreshAppsOperation?
+}
 
 extension AppDelegate
 {
@@ -376,10 +382,10 @@ extension AppDelegate
 {
     private func prepareForBackgroundFetch()
     {
-        // Restored (removed upstream in bde73894): without this the fetch interval is
-        // UIApplicationBackgroundFetchIntervalNever, so iOS never wakes SideStore to refresh apps.
-        // At most twice a day.
-        UIApplication.shared.setMinimumBackgroundFetchInterval(12 * 60 * 60)
+        // Background fetch was never granted by iOS in practice, so refresh runs as a
+        // BGProcessingTask instead (while charging, with network, at most every 12 hours).
+        UIApplication.shared.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalNever)
+        self.registerRefreshProcessingTask()
 
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { (success, error) in
             // no-op
@@ -388,6 +394,110 @@ extension AppDelegate
         #if DEBUG && targetEnvironment(simulator)
         UIApplication.shared.registerForRemoteNotifications()
         #endif
+    }
+
+    // MARK: - BGProcessingTask refresh
+
+    // "<bundle ID>.refresh". iloader and SideStore's own resign both rewrite the plist entry to the
+    // installed bundle ID. Only used if it is actually listed, since registering an unlisted
+    // identifier crashes the app.
+    private var refreshTaskIdentifier: String?
+    {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return nil }
+        let identifier = bundleID + ".refresh"
+        let permitted = Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String] ?? []
+        return permitted.contains(identifier) ? identifier : nil
+    }
+
+    private func registerRefreshProcessingTask()
+    {
+        guard let identifier = self.refreshTaskIdentifier else {
+            NSLog("[SideStoreBGRefresh] %@.refresh is not in BGTaskSchedulerPermittedIdentifiers; not registering", Bundle.main.bundleIdentifier ?? "nil")
+            return
+        }
+
+        let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: DispatchQueue.main) { task in
+            guard let task = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            self.handleRefreshProcessingTask(task)
+        }
+        NSLog("[SideStoreBGRefresh] registered %@: %@", identifier, registered ? "yes" : "no")
+
+        self.scheduleRefreshProcessingTask(replaceExisting: false)
+    }
+
+    // Opening SideStore must not push the next run back, so an already pending request is kept.
+    private func scheduleRefreshProcessingTask(replaceExisting: Bool)
+    {
+        guard let identifier = self.refreshTaskIdentifier else { return }
+
+        Task { @MainActor in
+            let requests = await BGTaskScheduler.shared.pendingTaskRequests()
+            if !replaceExisting, let pending = requests.first(where: { $0.identifier == identifier }) {
+                NSLog("[SideStoreBGRefresh] already pending, earliest %@", String(describing: pending.earliestBeginDate))
+                return
+            }
+
+            let request = BGProcessingTaskRequest(identifier: identifier)
+            request.requiresNetworkConnectivity = true
+            request.requiresExternalPower = true
+            request.earliestBeginDate = Date(timeIntervalSinceNow: 12 * 60 * 60) // At most twice a day.
+
+            do {
+                try BGTaskScheduler.shared.submit(request)
+                NSLog("[SideStoreBGRefresh] submitted, earliest %@", String(describing: request.earliestBeginDate))
+            } catch {
+                NSLog("[SideStoreBGRefresh] submit failed: %@", String(describing: error))
+            }
+        }
+    }
+
+    private func handleRefreshProcessingTask(_ task: BGProcessingTask)
+    {
+        NSLog("[SideStoreBGRefresh] task started")
+
+        // Queue the next run before doing anything else.
+        self.scheduleRefreshProcessingTask(replaceExisting: true)
+
+        guard UserDefaults.standard.isBackgroundRefreshEnabled else {
+            NSLog("[SideStoreBGRefresh] Background Refresh is off in SideStore settings")
+            task.setTaskCompleted(success: true)
+            return
+        }
+
+        let box = RefreshOperationBox()
+        task.expirationHandler = { @Sendable in
+            NSLog("[SideStoreBGRefresh] task expired before finishing")
+            box.operation?.cancel()
+            task.setTaskCompleted(success: false)
+        }
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                try await DatabaseManager.shared.start()
+
+                let context = DatabaseManager.shared.persistentContainer.newBackgroundContext()
+                let installedApps = InstalledApp.fetchAppsForBackgroundRefresh(in: context)
+                NSLog("[SideStoreBGRefresh] %ld app(s) due for refresh", installedApps.count)
+
+                box.operation = try AppManager.shared.backgroundRefresh(installedApps) { result in
+                    switch result {
+                    case .success(let results):
+                        let failures = results.filter { if case .failure = $0.value { return true } else { return false } }
+                        NSLog("[SideStoreBGRefresh] finished: %ld refreshed, %ld failed", results.count - failures.count, failures.count)
+                        task.setTaskCompleted(success: failures.isEmpty)
+                    case .failure(let error):
+                        NSLog("[SideStoreBGRefresh] finished with error: %@", String(describing: error))
+                        task.setTaskCompleted(success: false)
+                    }
+                }
+            } catch {
+                NSLog("[SideStoreBGRefresh] could not start: %@", String(describing: error))
+                task.setTaskCompleted(success: false)
+            }
+        }
     }
     
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data)
