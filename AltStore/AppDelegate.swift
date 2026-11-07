@@ -18,6 +18,7 @@ import BackgroundTasks
 private final class RefreshOperationBox: @unchecked Sendable
 {
     var operation: BackgroundRefreshAppsOperation?
+    var failed = false
 }
 
 extension AppDelegate
@@ -461,41 +462,68 @@ extension AppDelegate
         // Queue the next run before doing anything else.
         self.scheduleRefreshProcessingTask(replaceExisting: true)
 
-        guard UserDefaults.standard.isBackgroundRefreshEnabled else {
-            NSLog("[SideStoreBGRefresh] Background Refresh is off in SideStore settings")
-            task.setTaskCompleted(success: true)
-            return
+        // Like the original background fetch: check sources for app updates (and notify)
+        // alongside refreshing apps. The task completes when both are done.
+        let box = RefreshOperationBox()
+        let refreshEnabled = UserDefaults.standard.isBackgroundRefreshEnabled
+        if !refreshEnabled {
+            NSLog("[SideStoreBGRefresh] Background Refresh is off in SideStore settings; only checking sources")
         }
 
-        let box = RefreshOperationBox()
         task.expirationHandler = { @Sendable in
             NSLog("[SideStoreBGRefresh] task expired before finishing")
             box.operation?.cancel()
             task.setTaskCompleted(success: false)
         }
 
-        Task.detached(priority: .userInitiated) {
+        Task { @MainActor in
             do {
                 try await DatabaseManager.shared.start()
+            } catch {
+                NSLog("[SideStoreBGRefresh] could not start database: %@", String(describing: error))
+                task.setTaskCompleted(success: false)
+                return
+            }
 
+            let group = DispatchGroup()
+            group.enter()
+            if refreshEnabled { group.enter() }
+
+            self.fetchSources { result in
+                if case .failure(let error) = result {
+                    NSLog("[SideStoreBGRefresh] fetching sources failed: %@", String(describing: error))
+                    box.failed = true
+                }
+                group.leave()
+            }
+
+            if refreshEnabled {
                 let context = DatabaseManager.shared.persistentContainer.newBackgroundContext()
                 let installedApps = InstalledApp.fetchAppsForBackgroundRefresh(in: context)
                 NSLog("[SideStoreBGRefresh] %ld app(s) due for refresh", installedApps.count)
 
-                box.operation = try AppManager.shared.backgroundRefresh(installedApps) { result in
-                    switch result {
-                    case .success(let results):
-                        let failures = results.filter { if case .failure = $0.value { return true } else { return false } }
-                        NSLog("[SideStoreBGRefresh] finished: %ld refreshed, %ld failed", results.count - failures.count, failures.count)
-                        task.setTaskCompleted(success: failures.isEmpty)
-                    case .failure(let error):
-                        NSLog("[SideStoreBGRefresh] finished with error: %@", String(describing: error))
-                        task.setTaskCompleted(success: false)
+                do {
+                    box.operation = try AppManager.shared.backgroundRefresh(installedApps) { result in
+                        switch result {
+                        case .success(let results):
+                            let failures = results.filter { if case .failure = $0.value { return true } else { return false } }
+                            NSLog("[SideStoreBGRefresh] finished: %ld refreshed, %ld failed", results.count - failures.count, failures.count)
+                            if !failures.isEmpty { box.failed = true }
+                        case .failure(let error):
+                            NSLog("[SideStoreBGRefresh] finished with error: %@", String(describing: error))
+                            box.failed = true
+                        }
+                        group.leave()
                     }
+                } catch {
+                    NSLog("[SideStoreBGRefresh] could not start refresh: %@", String(describing: error))
+                    box.failed = true
+                    group.leave()
                 }
-            } catch {
-                NSLog("[SideStoreBGRefresh] could not start: %@", String(describing: error))
-                task.setTaskCompleted(success: false)
+            }
+
+            group.notify(queue: .main) {
+                task.setTaskCompleted(success: !box.failed)
             }
         }
     }
