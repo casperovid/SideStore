@@ -436,14 +436,16 @@ extension AppDelegate
 
         Task { @MainActor in
             let requests = await BGTaskScheduler.shared.pendingTaskRequests()
-            if !replaceExisting, let pending = requests.first(where: { $0.identifier == identifier }) {
+            // A request left over from an older build may still require charging; replace it.
+            if !replaceExisting, let pending = requests.first(where: { $0.identifier == identifier }),
+               !((pending as? BGProcessingTaskRequest)?.requiresExternalPower ?? false) {
                 NSLog("[SideStoreBGRefresh] already pending, earliest %@", String(describing: pending.earliestBeginDate))
                 return
             }
 
             let request = BGProcessingTaskRequest(identifier: identifier)
             request.requiresNetworkConnectivity = true
-            request.requiresExternalPower = true
+            request.requiresExternalPower = false
             request.earliestBeginDate = Date(timeIntervalSinceNow: 12 * 60 * 60) // At most twice a day.
 
             do {
